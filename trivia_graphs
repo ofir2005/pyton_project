@@ -1,0 +1,93 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import mysql.connector
+
+def fetch_data_from_db():
+    """
+    יוצר חיבור למסד הנתונים, שולף את הנתונים מטבלת scores ומחזיר DataFrame.
+    """
+    db_host = "127.0.0.1"
+    db_user = "root"
+    db_password = "Speedman1978"
+    db_name = "python_project"
+
+    conn = mysql.connector.connect(
+        host=db_host,
+        user=db_user,
+        password=db_password,
+        database=db_name
+    )
+    query = "SELECT id, player_name, score, category, date_played FROM scores"
+    df = pd.read_sql(query, conn)
+    conn.close()
+    return df
+
+# טעינת הנתונים מהבסיס
+df = fetch_data_from_db()
+
+# המרת העמודה date_played לפורמט datetime והוספת עמודת שעה
+df['date_played'] = pd.to_datetime(df['date_played'])
+df['hour'] = df['date_played'].dt.hour
+
+# ----------------- גרף א. ממוצע ציונים לפי שעה לכלל הנתונים -----------------
+# מחשבים ממוצע ניקוד לפי שעה על בסיס כל הרשומות
+avg_scores_by_hour = df.groupby('hour')['score'].mean().reindex(range(24), fill_value=np.nan)
+
+# הכנת DataFrame לציור עם חלוקה לשעות (Night, Day, Evening)
+day_night = pd.DataFrame({
+    'Hour': range(24),
+    'Score': avg_scores_by_hour.values
+})
+day_night['Period'] = pd.cut(day_night['Hour'], bins=[0, 6, 18, 24],
+                              labels=['Night', 'Day', 'Evening'], right=False)
+
+plt.figure(figsize=(10, 6))
+plt.plot(day_night['Hour'], day_night['Score'], marker='o')
+plt.axvspan(0, 6, alpha=0.2, color='blue', label='Night')
+plt.axvspan(6, 18, alpha=0.2, color='yellow', label='Day')
+plt.axvspan(18, 24, alpha=0.2, color='purple', label='Evening')
+plt.title('Average Score by Hour (All Data)')
+plt.xlabel('Hour of Day')
+plt.ylabel('Average Score')
+plt.legend()
+plt.grid(True)
+plt.show()
+
+# ----------------- גרף ב. השוואת ממוצע ציונים לכל שחקן -----------------
+# מחשבים ממוצע ניקוד לכל שחקן על בסיס כל הרשומות
+avg_scores_by_player = df.groupby('player_name')['score'].mean().sort_values()
+
+plt.figure(figsize=(12, 6))
+avg_scores_by_player.plot(kind='bar')
+plt.title('Comparison of Average Scores by Player (All Data)')
+plt.xlabel('Player')
+plt.ylabel('Average Score')
+plt.xticks(rotation=45, ha='right')
+plt.grid(True)
+plt.show()
+
+# ----------------- גרף ג. התפלגות שעות המשחק (Pie Chart) -----------------
+# סופרים את מספר הרשומות עבור כל שעה
+play_time_counts = df['hour'].value_counts().sort_index()
+
+plt.figure(figsize=(8, 8))
+plt.pie(play_time_counts, labels=play_time_counts.index, autopct='%1.1f%%', startangle=90)
+plt.title('Distribution of Play Times (All Data)')
+plt.show()
+
+# ----------------- גרף ד. גרף פיזור עם קו מגמה (Rolling Average) -----------------
+# גרף פיזור של כל רשומת ציון מול שעה, וממוצע נע על ממוצע הציונים לפי שעה
+plt.figure(figsize=(10, 6))
+plt.scatter(df['hour'], df['score'], alpha=0.6, label='Individual Scores')
+
+# ממוצע לפי שעה (כפי שחישבנו בגרף א)
+rolling_avg = pd.Series(avg_scores_by_hour).rolling(window=3).mean()
+plt.plot(range(24), rolling_avg, color='red', marker='o', label='3-Hour Rolling Average')
+
+plt.title('Score Distribution vs. Hour with Rolling Average (All Data)')
+plt.xlabel('Hour of Day')
+plt.ylabel('Score')
+plt.legend()
+plt.grid(True)
+plt.show()
