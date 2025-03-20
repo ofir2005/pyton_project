@@ -1,0 +1,760 @@
+import pygame
+import sys
+import threading
+import json
+import requests
+import re
+import mysql.connector
+import os
+from datetime import datetime
+
+pygame.init()
+pygame.mixer.init()  # Initialize the mixer for sound
+
+WIDTH, HEIGHT = 1000, 700
+screen = pygame.display.set_mode((WIDTH, HEIGHT))
+pygame.display.set_caption("Trivia Game - AI Generated Questions")
+
+# Colors
+WHITE = (255, 255, 255)
+BLACK = (0, 0, 0)
+BLUE = (70, 130, 180)
+GREEN = (34, 139, 34)
+RED = (220, 20, 60)
+LIGHT_GRAY = (240, 240, 240)
+YELLOW = (255, 215, 0)
+PURPLE = (147, 112, 219)
+HIGHLIGHT_COLOR = (200, 220, 255)  # צבע הדגשה לריחוף עם העכבר
+DISABLED_COLOR = (200, 200, 200)
+DISABLED_TEXT = (150, 150, 150)
+
+# Fonts
+font = pygame.font.Font(None, 40)
+large_font = pygame.font.Font(None, 60)
+small_font = pygame.font.Font(None, 30)  # Added smaller font for long feedback
+
+# Load sounds (replace with your file paths)
+try:
+    pygame.mixer.music.load("chill-drum-loop-6887.mp3")  # Background music file
+    correct_sound = pygame.mixer.Sound("ding-small-bell-sfx-233008.mp3")  # Correct answer sound
+    incorrect_sound = pygame.mixer.Sound("incorrect-293358.mp3")  # Incorrect answer sound
+except pygame.error as e:
+    print(f"Error loading audio files: {e}. Please ensure the files are in the working directory: {os.getcwd()}")
+    sys.exit(1)
+
+# Play background music on loop
+pygame.mixer.music.play(-1)  # -1 means loop indefinitely
+pygame.mixer.music.set_volume(0.3)  # Set volume (0.0 to 1.0)
+
+# Global variables
+seen_questions = set()
+GROQ_API_KEY = "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"
+questions_per_category = 5
+total_categories_to_play = 6
+total_questions = questions_per_category * total_categories_to_play  # 5 * 6 = 30
+question_cache = {}  # Cache to store pre-generated questions
+failed_categories = set()  # Track categories that failed to generate questions
+
+
+# --- Database Setup ---
+def initialize_database():
+    try:
+        conn = mysql.connector.connect(
+            host="127.0.0.1",
+            user="root",
+            password="Speedman1978",
+            database="python_project"
+        )
+        cursor = conn.cursor()
+
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS scores (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            player_name VARCHAR(255) NOT NULL,
+            score INT NOT NULL,
+            category VARCHAR(255) NOT NULL,
+            date_played DATETIME NOT NULL
+        )
+        ''')
+        conn.commit()
+        conn.close()
+        print("✅ Database initialized successfully")
+
+    except mysql.connector.Error as e:
+        print(f"❌ Error initializing database: {e}")
+        sys.exit(1)  # Exit the script if the database connection fails
+
+
+
+def save_score(player_name, score, category):
+    date_played = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    try:
+        conn = mysql.connector.connect(
+            host="127.0.0.1",
+            user="root",
+            password="Speedman1978",
+            database="python_project"
+        )
+        cursor = conn.cursor()
+
+        cursor.execute(
+            "INSERT INTO scores (player_name, score, category, date_played) VALUES (%s, %s, %s, %s)",
+            (player_name, score, category, date_played)
+        )
+        conn.commit()
+        conn.close()
+        print(f"✅ Score saved: {player_name}, {score}, {category}, {date_played}")
+
+    except mysql.connector.Error as e:
+        print(f"❌ Error saving score: {e}")
+
+
+
+# --- Drawing Functions ---
+def draw_gradient_background():
+    for y in range(HEIGHT):
+        r = int(YELLOW[0] + (PURPLE[0] - YELLOW[0]) * y / HEIGHT)
+        g = int(YELLOW[1] + (PURPLE[1] - YELLOW[1]) * y / HEIGHT)
+        b = int(YELLOW[2] + (PURPLE[2] - YELLOW[2]) * y / HEIGHT)
+        pygame.draw.line(screen, (r, g, b), (0, y), (WIDTH, y))
+
+
+def draw_text(text, x, y, font_obj, color=BLACK):
+    text_surface = font_obj.render(text, True, color)
+    screen.blit(text_surface, (x, y))
+
+
+def draw_text_centered(text, x, y, font_obj, color=BLACK):
+    text_surface = font_obj.render(text, True, color)
+    text_rect = text_surface.get_rect(center=(x, y))
+    screen.blit(text_surface, text_rect)
+
+
+def wrap_text(text, font_obj, max_width):
+    words = text.split(" ")
+    lines = []
+    current_line = ""
+    for word in words:
+        test_line = current_line + word + " "
+        if font_obj.size(test_line)[0] < max_width:
+            current_line = test_line
+        else:
+            lines.append(current_line)
+            current_line = word + " "
+    if current_line:
+        lines.append(current_line)
+    return lines
+
+
+# --- Player Name Input ---
+def get_player_name():
+    input_box_rect = pygame.Rect(WIDTH // 2 - 200, HEIGHT // 2, 400, 60)
+    player_name = ""
+    active = True
+
+    while active:
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                pygame.quit()
+                sys.exit()
+            elif event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_RETURN and player_name.strip():
+                    print(f"✅ Player entered name: {player_name}")
+                    return player_name.strip()
+                elif event.key == pygame.K_BACKSPACE:
+                    player_name = player_name[:-1]
+                else:
+                    player_name += event.unicode
+
+        draw_gradient_background()
+        draw_text_centered("Enter your name:", WIDTH // 2, HEIGHT // 2 - 50, large_font, BLUE)
+
+        # Draw the input box
+        pygame.draw.rect(screen, LIGHT_GRAY, input_box_rect, border_radius=5)
+        # Render the player name inside the box
+        text_surface = font.render(player_name, True, BLACK)
+        screen.blit(text_surface, (input_box_rect.x + 10, input_box_rect.y + 10))
+
+        pygame.display.flip()
+        pygame.time.Clock().tick(30)
+
+
+# --- Initialize DB and ask for player name ---
+initialize_database()
+player_name = get_player_name()
+
+# --- Game Variables ---
+selected_category = None
+score = 0
+current_question = None
+loading = False
+questions_answered = 0
+categories_completed = 0
+game_over = False
+date_played = None
+feedback_message = None
+feedback_timer = 0
+used_categories = []
+current_category_questions = 0  # Track questions within the current category
+show_category_completed = False  # Flag for category completion screen
+category_completion_timer = 0  # Timer for category completion screen
+waiting_for_feedback = False  # Flag to wait for feedback before showing category completion
+
+
+# --- Pre-generate questions for all categories ---
+def preload_questions_thread():
+    categories = ["History", "Computer Science", "Science", "Geography", "Movies", "Sports"]
+    print("🔄 Preloading questions in background...")
+
+    for category in categories:
+        if category not in question_cache:
+            question_cache[category] = []
+
+        # Only preload if we don't have enough questions
+        while len(question_cache[category]) < questions_per_category:
+            question, options, answer = fetch_question_from_ai(category, "medium")
+            if question is not None:
+                question_cache[category].append((question, options, answer))
+                print(f"✅ Preloaded question for {category} ({len(question_cache[category])}/{questions_per_category})")
+            else:
+                # If we can't get a question after several attempts, break to avoid infinite loop
+                if category in failed_categories:
+                    print(f"❌ Failed to preload questions for {category}. Skipping.")
+                    break
+                failed_categories.add(category)
+
+
+# --- Fetch question from AI ---
+def fetch_question_from_ai(category, difficulty):
+    url = "https://api.groq.com/openai/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    prompt = (
+        f"Generate a {difficulty} multiple-choice trivia question about {category}. "
+        "The question should be different from any you've generated before. "
+        "Strictly return only a JSON object like this: "
+        '{"question": "What is the capital of France?", "options": ["Berlin", "Madrid", "Paris", "Lisbon"], "answer": "Paris"}'
+    )
+    data = {
+        "model": "llama3-8b-8192",
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 300
+    }
+    try:
+        response = requests.post(url, headers=headers, json=data)
+        response_json = response.json()
+        if "choices" in response_json and len(response_json["choices"]) > 0:
+            ai_output = response_json["choices"][0]["message"]["content"]
+            json_match = re.search(r'\{.*\}', ai_output, re.DOTALL)
+            if json_match:
+                json_str = json_match.group(0)
+            else:
+                return None, None, None
+            try:
+                data = json.loads(json_str)
+                question_text = data["question"].strip()
+                options = data["options"]
+                answer = data["answer"]
+
+                # Ensure the answer is in the options
+                if answer not in options:
+                    print(f"⚠️ Answer '{answer}' not in options. Fixing...")
+                    # Replace the last option with the correct answer if it's not already there
+                    if len(options) > 0:
+                        options[-1] = answer
+                    else:
+                        options = [answer, "Option 2", "Option 3", "Option 4"]
+
+                # Check if we've seen this question before
+                if question_text.lower() in seen_questions:
+                    return None, None, None
+
+                seen_questions.add(question_text.lower())
+                return question_text, options, answer
+            except (json.JSONDecodeError, KeyError) as e:
+                print(f"❌ Error parsing question JSON: {e}")
+                return None, None, None
+    except Exception as e:
+        print(f"❌ Error fetching question from AI: {e}")
+    return None, None, None
+
+
+# --- Draw Question with Hover Highlight ---
+def draw_question(question_data, mouse_pos):
+    """
+    מציג את השאלה והאפשרויות. כאשר המשתמש מרחף עם העכבר מעל אחת האפשרויות,
+    נצבע את הרקע שלה בצבע HIGHLIGHT_COLOR.
+    """
+    if question_data is None or question_data[0] is None:
+        draw_text_centered("❌ Error: No question available", WIDTH // 2, HEIGHT // 2, large_font, RED)
+        return
+
+    question_text, options, _ = question_data
+    wrapped_text = wrap_text(question_text, font, WIDTH - 100)
+
+    # Draw question box with shadow
+    question_box_height = len(wrapped_text) * 45 + 20
+    # Shadow
+    pygame.draw.rect(screen, (0, 0, 0, 50), (48, 98, WIDTH - 96, question_box_height), border_radius=10)
+    # Box
+    pygame.draw.rect(screen, WHITE, (45, 95, WIDTH - 90, question_box_height), border_radius=10)
+
+    # Draw question lines
+    y_offset = 105
+    for line in wrapped_text:
+        draw_text(line, 60, y_offset, font, BLUE)
+        y_offset += 45
+
+    # Draw answer boxes
+    answer_y = y_offset + 30
+    for i, option in enumerate(options):
+        option_rect = pygame.Rect(40, answer_y - 10, WIDTH - 80, 50)
+        # בדיקה האם העכבר מעל הריבוע
+        if option_rect.collidepoint(mouse_pos):
+            pygame.draw.rect(screen, HIGHLIGHT_COLOR, option_rect, border_radius=5)
+        else:
+            pygame.draw.rect(screen, LIGHT_GRAY, option_rect, border_radius=5)
+        draw_text(f"{chr(65 + i)}. {option}", 60, answer_y, font)
+        answer_y += 70  # Increased spacing between options
+
+
+# --- Draw feedback (Correct / Incorrect) ---
+def draw_feedback():
+    global feedback_message, feedback_timer
+    if feedback_message:
+        color = GREEN if "Correct" in feedback_message else RED
+        s = pygame.Surface((WIDTH - 100, 130), pygame.SRCALPHA)  # Increase height and width
+        s.fill((255, 255, 255, 220))
+        screen.blit(s, (50, HEIGHT // 2 - 65))
+
+        if len(feedback_message) > 40:
+            # For long messages, use smaller font and wrap text
+            lines = wrap_text(feedback_message, small_font, WIDTH - 150)
+            y_offset = HEIGHT // 2 - 40
+            for line in lines:
+                draw_text_centered(line, WIDTH // 2, y_offset, small_font, color)
+                y_offset += 30
+        else:
+            draw_text_centered(feedback_message, WIDTH // 2, HEIGHT // 2, font, color)
+
+        feedback_timer -= 1
+        if feedback_timer <= 0:
+            feedback_message = None
+
+
+# --- Category Completed ---
+def draw_category_completed():
+    global category_completion_timer
+
+    draw_gradient_background()
+
+    # Header with shadow
+    pygame.draw.rect(screen, (0, 0, 0, 50), (WIDTH // 2 - 230, 98, 460, 60), border_radius=10)
+    pygame.draw.rect(screen, WHITE, (WIDTH // 2 - 225, 95, 450, 60), border_radius=10)
+    draw_text_centered("Category Completed!", WIDTH // 2, 125, large_font, BLUE)
+
+    # Statistics box
+    stats_box = pygame.Rect(WIDTH // 2 - 250, 180, 500, 220)
+    pygame.draw.rect(screen, (0, 0, 0, 50), stats_box.inflate(6, 6), border_radius=15)
+    pygame.draw.rect(screen, WHITE, stats_box, border_radius=15)
+
+    draw_text_centered(f"Player: {player_name}", WIDTH // 2, 220, font, BLACK)
+    draw_text_centered(f"Current Score: {score}/{total_questions}", WIDTH // 2, 270, font, GREEN)
+    draw_text_centered(f"Categories Completed: {categories_completed}/{total_categories_to_play}", WIDTH // 2, 320,
+                       font, BLUE)
+    questions_left = total_questions - questions_answered
+    draw_text_centered(f"Questions Left: {questions_left}", WIDTH // 2, 370, font, BLACK)
+
+    # Button with shadow effect
+    button_rect = pygame.Rect(WIDTH // 2 - 180, 450, 360, 70)
+
+    # Only show the button if the timer has elapsed
+    if category_completion_timer <= 0:
+        pygame.draw.rect(screen, (0, 0, 0, 50), button_rect.inflate(6, 6), border_radius=10)
+        pygame.draw.rect(screen, LIGHT_GRAY, button_rect, border_radius=10)
+
+        # Check if mouse is over button
+        mouse_pos = pygame.mouse.get_pos()
+        if button_rect.collidepoint(mouse_pos):
+            pygame.draw.rect(screen, HIGHLIGHT_COLOR, button_rect, border_radius=10)
+
+        draw_text_centered("Choose Next Category", WIDTH // 2, 485, font, BLUE)
+    else:
+        # Show timer
+        category_completion_timer -= 1
+        draw_text_centered(f"Next in {category_completion_timer // 30 + 1}...", WIDTH // 2, 485, font, BLUE)
+
+
+# --- Game Over ---
+def draw_game_over():
+    global date_played
+    draw_gradient_background()
+
+    # Trophy icon (simple representation)
+    pygame.draw.polygon(screen, YELLOW, [
+        (WIDTH // 2, 50),
+        (WIDTH // 2 - 60, 70),
+        (WIDTH // 2 - 30, 120),
+        (WIDTH // 2 + 30, 120),
+        (WIDTH // 2 + 60, 70)
+    ])
+
+    # Trophy base
+    pygame.draw.rect(screen, YELLOW, (WIDTH // 2 - 20, 120, 40, 30))
+    pygame.draw.rect(screen, YELLOW, (WIDTH // 2 - 40, 150, 80, 10))
+
+    # Header
+    draw_text_centered("Game Completed!", WIDTH // 2, 200, large_font, BLUE)
+
+    # Stats box
+    stats_box = pygame.Rect(WIDTH // 2 - 200, 250, 400, 180)
+    pygame.draw.rect(screen, (0, 0, 0, 50), stats_box.inflate(6, 6), border_radius=15)
+    pygame.draw.rect(screen, WHITE, stats_box, border_radius=15)
+
+    draw_text_centered(f"Player: {player_name}", WIDTH // 2, 280, font, BLACK)
+    draw_text_centered(f"Final Score: {score}/{total_questions}", WIDTH // 2, 320, font, BLACK)
+    percentage = (score / total_questions) * 100
+
+    # Color the percentage based on performance
+    percentage_color = RED
+    if percentage >= 80:
+        percentage_color = GREEN
+    elif percentage >= 60:
+        percentage_color = BLUE
+
+    draw_text_centered(f"Percentage: {percentage:.1f}%", WIDTH // 2, 360, font, percentage_color)
+    if not date_played:
+        date_played = datetime.now().strftime("%d/%m/%Y %H:%M")
+    draw_text_centered(f"Date: {date_played}", WIDTH // 2, 400, font, BLACK)
+
+    # Play Again button
+    play_again_rect = pygame.Rect(WIDTH // 2 - 150, 450, 300, 60)
+    mouse_pos = pygame.mouse.get_pos()
+
+    # Shadow effect
+    pygame.draw.rect(screen, (0, 0, 0, 50), play_again_rect.inflate(6, 6), border_radius=10)
+
+    # Button with hover effect
+    if play_again_rect.collidepoint(mouse_pos):
+        pygame.draw.rect(screen, HIGHLIGHT_COLOR, play_again_rect, border_radius=10)
+    else:
+        pygame.draw.rect(screen, LIGHT_GRAY, play_again_rect, border_radius=10)
+
+    draw_text_centered("Play Again", WIDTH // 2, 480, font, BLUE)
+
+    # Quit button
+    quit_rect = pygame.Rect(WIDTH // 2 - 150, 530, 300, 60)
+
+    # Shadow effect
+    pygame.draw.rect(screen, (0, 0, 0, 50), quit_rect.inflate(6, 6), border_radius=10)
+
+    # Button with hover effect
+    if quit_rect.collidepoint(mouse_pos):
+        pygame.draw.rect(screen, HIGHLIGHT_COLOR, quit_rect, border_radius=10)
+    else:
+        pygame.draw.rect(screen, LIGHT_GRAY, quit_rect, border_radius=10)
+
+    draw_text_centered("Quit Game", WIDTH // 2, 560, font, RED)
+
+
+# --- Generate Next Question (Async) ---
+def generate_next_question():
+    global current_question, loading, selected_category
+    global questions_answered, categories_completed, game_over, date_played
+    global current_category_questions, show_category_completed, category_completion_timer
+    global waiting_for_feedback
+
+    def target():
+        global current_question, loading, selected_category
+        global questions_answered, categories_completed, game_over, date_played
+        global current_category_questions, show_category_completed, category_completion_timer
+        global waiting_for_feedback
+
+        if current_category_questions == 0:  # First question of the category
+            current_category_questions = 1
+        elif current_category_questions < questions_per_category:
+            current_category_questions += 1
+
+        questions_answered += 1
+
+        if current_category_questions >= questions_per_category:
+            categories_completed += 1
+            used_categories.append(selected_category)
+            current_category_questions = 0
+
+            if categories_completed >= total_categories_to_play:
+                loading = False
+                game_over = True
+                date_played = save_score(player_name, score, "Multiple Categories")
+                return
+            else:
+                # Wait for any feedback to finish before showing category completion
+                if not waiting_for_feedback:
+                    loading = False
+                    show_category_completed = True
+                    category_completion_timer = 90  # 3 seconds at 30 FPS
+                    return
+
+        # Try to get a cached question first
+        if selected_category in question_cache and question_cache[selected_category]:
+            current_question = question_cache[selected_category].pop(0)
+            loading = False
+            return
+
+        # If we couldn't get a cached question, generate a new one
+        max_attempts = 10
+        attempts = 0
+        result = (None, None, None)
+        print(f"🔄 Generating question {questions_answered} (Category: {selected_category})...")
+
+        while attempts < max_attempts:
+            result = fetch_question_from_ai(selected_category, "medium")
+            if result[0] is not None:
+                break
+            attempts += 1
+            print(f"⚠️ Attempt {attempts}/{max_attempts} failed for {selected_category}")
+
+        # If we still couldn't get a question after multiple attempts
+        if result[0] is None:
+            print(f"❌ Failed to generate question for {selected_category} after {max_attempts} attempts")
+            # Create a fallback question
+            question = f"What category is this question from?"
+            options = ["History", "Science", "Geography", selected_category]
+            answer = selected_category
+            result = (question, options, answer)
+
+        current_question = result
+        loading = False
+
+    loading = True
+    thread = threading.Thread(target=target)
+    thread.daemon = True
+    thread.start()
+
+
+# --- Reset Game ---
+def reset_game():
+    global selected_category, score, current_question, loading
+    global questions_answered, categories_completed, game_over, date_played
+    global feedback_message, feedback_timer, used_categories, current_category_questions
+    global show_category_completed, category_completion_timer, waiting_for_feedback, failed_categories
+
+    selected_category = None
+    score = 0
+    current_question = None
+    loading = False
+    questions_answered = 0
+    categories_completed = 0
+    game_over = False
+    date_played = None
+    feedback_message = None
+    feedback_timer = 0
+    used_categories = []
+    seen_questions.clear()
+    current_category_questions = 0
+    show_category_completed = False
+    category_completion_timer = 0
+    waiting_for_feedback = False
+    failed_categories = set()
+
+    # Start preloading questions again
+    thread = threading.Thread(target=preload_questions_thread)
+    thread.daemon = True
+    thread.start()
+
+
+# --- Category Availability ---
+def is_category_available(category):
+    return category not in used_categories
+
+
+# Start preloading questions in background
+thread = threading.Thread(target=preload_questions_thread)
+thread.daemon = True
+thread.start()
+
+# --- Main Game Loop ---
+running = True
+clock = pygame.time.Clock()
+
+while running:
+    mouse_x, mouse_y = pygame.mouse.get_pos()
+    mouse_pos = (mouse_x, mouse_y)
+
+    for event in pygame.event.get():
+        if event.type == pygame.QUIT:
+            running = False
+
+        elif event.type == pygame.KEYDOWN:
+            if event.key == pygame.K_ESCAPE:
+                running = False
+            elif selected_category is None and not show_category_completed and event.key in [pygame.K_1, pygame.K_2,
+                                                                                             pygame.K_3, pygame.K_4,
+                                                                                             pygame.K_5, pygame.K_6]:
+                categories = ["History", "Computer Science", "Science", "Geography", "Movies", "Sports"]
+                selected_index = event.key - pygame.K_1
+                if 0 <= selected_index < len(categories):
+                    cat = categories[selected_index]
+                    if is_category_available(cat):
+                        selected_category = cat
+                        print(f"✅ Selected category: {selected_category}")
+                        generate_next_question()
+
+        elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            # Check if game over
+            if game_over:
+                play_again_rect = pygame.Rect(WIDTH // 2 - 150, 450, 300, 60)
+                quit_rect = pygame.Rect(WIDTH // 2 - 150, 530, 300, 60)
+
+                if play_again_rect.collidepoint(mouse_pos):
+                    reset_game()
+                elif quit_rect.collidepoint(mouse_pos):
+                    running = False
+
+            # Check if category completed screen is shown
+            elif show_category_completed:
+                button_rect = pygame.Rect(WIDTH // 2 - 180, 450, 360, 70)
+                if button_rect.collidepoint(mouse_pos) and category_completion_timer <= 0:
+                    show_category_completed = False
+                    selected_category = None
+
+            # Category selection screen
+            elif selected_category is None:
+                categories = ["History", "Computer Science", "Science", "Geography", "Movies", "Sports"]
+                for i, cat in enumerate(categories):
+                    y_pos = 245 + i * 60
+                    rect = pygame.Rect(290, y_pos, 350, 50)
+                    if rect.collidepoint(mouse_pos) and cat not in used_categories:
+                        selected_category = cat
+                        print(f"✅ Selected category: {selected_category}")
+                        generate_next_question()
+                        break
+
+            # Question screen - check answer selection
+            elif current_question is not None and not loading and feedback_message is None:
+                options = current_question[1]
+                correct_answer = current_question[2]
+                wrapped_text = wrap_text(current_question[0], font, WIDTH - 100)
+
+                # Calculate position of answer options
+                answer_y_start = 105 + len(wrapped_text) * 45 + 30
+
+                for i, option in enumerate(options):
+                    option_rect = pygame.Rect(40, answer_y_start - 10, WIDTH - 80, 50)
+                    if option_rect.collidepoint(mouse_pos):
+                        # User clicked on this option
+                        if option == correct_answer:
+                            score += 1
+                            feedback_message = "Correct!"
+                            correct_sound.play()
+                            print(f"✅ Correct! New score: {score}")
+                        else:
+                            feedback_message = f"Incorrect! The answer is: {correct_answer}"
+                            incorrect_sound.play()
+                            print(f"❌ Wrong! Correct answer was: {correct_answer}")
+
+                        # Shorter feedback timer (1 second at 30 FPS)
+                        feedback_timer = 30
+                        waiting_for_feedback = True
+
+
+                        def delayed_next_question():
+                            global feedback_message, waiting_for_feedback
+                            # Wait for feedback timer
+                            pygame.time.wait(1000)  # 1 second
+                            waiting_for_feedback = False
+                            generate_next_question()
+
+
+                        thread = threading.Thread(target=delayed_next_question)
+                        thread.daemon = True
+                        thread.start()
+                        break
+                    answer_y_start += 70  # Match the spacing from draw_question
+
+    # --- Draw Screen ---
+    draw_gradient_background()
+
+    if game_over:
+        draw_game_over()
+    elif show_category_completed:
+        draw_category_completed()
+    elif selected_category is None:
+        # Header
+        draw_text_centered(f"Welcome, {player_name}!", WIDTH // 2, 50, large_font, BLUE)
+
+        # Stats display if game already started
+        if categories_completed > 0:
+            stats_box = pygame.Rect(WIDTH - 320, 20, 300, 90)
+            pygame.draw.rect(screen, (255, 255, 255, 180), stats_box, border_radius=10)
+            draw_text(f"Score: {score}/{total_questions}", WIDTH - 310, 30, font, GREEN)
+            draw_text(f"Categories: {categories_completed}/{total_categories_to_play}", WIDTH - 310, 70, font, BLUE)
+
+        # Category selection header
+        pygame.draw.rect(screen, WHITE, (190, 140, 620, 60), border_radius=10)
+        draw_text_centered("Select a Category:", WIDTH // 2, 170, large_font, BLUE)
+
+        categories = ["History", "Computer Science", "Science", "Geography", "Movies", "Sports"]
+        for i, cat in enumerate(categories):
+            y_pos = 245 + i * 60
+            rect = pygame.Rect(290, y_pos, 350, 50)
+
+            if cat in used_categories:
+                # Shadow for disabled category
+                pygame.draw.rect(screen, (0, 0, 0, 30), rect.inflate(4, 4), border_radius=5)
+                pygame.draw.rect(screen, DISABLED_COLOR, rect, border_radius=5)
+                draw_text(f"{i + 1}. {cat} (Completed)", rect.x + 10, rect.y + 5, font, DISABLED_TEXT)
+            else:
+                # Shadow for active category
+                pygame.draw.rect(screen, (0, 0, 0, 50), rect.inflate(4, 4), border_radius=5)
+
+                # Highlight if mouse is over
+                if rect.collidepoint(mouse_pos):
+                    pygame.draw.rect(screen, HIGHLIGHT_COLOR, rect, border_radius=5)
+                else:
+                    pygame.draw.rect(screen, LIGHT_GRAY, rect, border_radius=5)
+
+                draw_text(f"{i + 1}. {cat}", rect.x + 10, rect.y + 5, font, BLACK)
+
+    elif loading:
+        # Loading
+        # Loading animation (pulsating circle)
+        pulse = (pygame.time.get_ticks() % 1000) / 1000  # Value between 0 and 1
+        radius = 30 + int(10 * pulse)  # Radius between 30 and 40
+
+        pygame.draw.circle(screen, BLUE, (WIDTH // 2, HEIGHT // 2 - 50), radius)
+        pygame.draw.circle(screen, WHITE, (WIDTH // 2, HEIGHT // 2 - 50), radius - 5)
+
+        draw_text_centered("Loading question...", WIDTH // 2, HEIGHT // 2 + 20, large_font, BLUE)
+        draw_text_centered(f"Category: {selected_category}", WIDTH // 2, HEIGHT // 2 + 80, font)
+
+        display_question_num = current_category_questions if current_category_questions > 0 else 1
+        draw_text_centered(f"Question {display_question_num}/{questions_per_category} in this category",
+                           WIDTH // 2, HEIGHT // 2 + 120, font)
+        draw_text_centered(f"Total Progress: {questions_answered}/{total_questions}",
+                           WIDTH // 2, HEIGHT // 2 + 160, font)
+    else:
+        # Question screen - top status bar
+        pygame.draw.rect(screen, (255, 255, 255, 180), (0, 0, WIDTH, 80))
+
+        display_question_num = current_category_questions if current_category_questions > 0 else 1
+        draw_text(f"Question {display_question_num}/{questions_per_category}", WIDTH - 250, 20, font)
+        draw_text(f"Score: {score}", WIDTH - 150, 50, font, GREEN)
+        draw_text(f"Category: {selected_category}", 50, 20, font, BLUE)
+        draw_text(f"Total Progress: {questions_answered}/{total_questions}", 50, 50, font)
+
+        # Draw the actual question and options
+        draw_question(current_question, mouse_pos)
+
+        # Show feedback if there is any
+        if feedback_message:
+            draw_feedback()
+
+    pygame.display.flip()
+    clock.tick(30)
+
+pygame.quit()
+sys.exit()
