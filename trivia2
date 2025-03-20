@@ -1,0 +1,930 @@
+import pygame
+import sys
+import threading
+import json
+import requests
+import re
+import mysql.connector
+import os
+from datetime import datetime
+
+pygame.init()
+pygame.mixer.init()  # אתחול ה־mixer של Pygame לצורך ניגון סאונד
+
+
+class TriviaModel:
+    """
+    מחלקה זו (Model) מנהלת את מצב המשחק (Game State) ואת הלוגיקה העסקית:
+    - גישה למסד הנתונים (CRUD עבור ניקוד).
+    - שמירה וטעינה של שאלות (מ־API או ממטמון).
+    - ניהול קטגוריות, שאלות שכבר נצפו, תיעוד כישלונות ועוד.
+    - הגדרת משתני משחק כמו מספר שאלות לקטגוריה, ניקוד נוכחי, קטגוריה נוכחית וכו'.
+    """
+
+    def __init__(self):
+        """
+        אתחול כל הנתונים ההכרחיים לאפליקציה.
+        """
+        # פרטי מסד הנתונים
+        self.db_host = "127.0.0.1"
+        self.db_user = "root"
+        self.db_password = "Speedman1978"
+        self.db_name = "python_project"
+
+        # מצב המשחק (Game State)
+        self.player_name = ""               # שם השחקן
+        self.selected_category = None       # קטגוריה שנבחרה כרגע
+        self.score = 0                      # ניקוד השחקן
+        self.questions_answered = 0         # כמה שאלות נענו עד כה
+        self.categories_completed = 0       # מספר קטגוריות שהושלמו
+        self.game_over = False              # האם המשחק הסתיים
+        self.date_played = None             # תאריך/זמן בו השחקן סיים משחק
+        self.used_categories = []           # קטגוריות שכבר נבחרו במהלך המשחק
+        self.current_category_questions = 0 # כמה שאלות נענו בקטגוריה נוכחית
+        self.show_category_completed = False# האם להציג מסך קטגוריה הושלמה
+        self.category_completion_timer = 0  # טיימר פנימי לשהייה על מסך Completion
+        self.waiting_for_feedback = False   # האם מחכים לסיום הצגת הפידבק לאחר תשובה
+
+        # נתונים הקשורים לשאלות ו־API
+        self.GROQ_API_KEY = "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"
+        self.seen_questions = set()         # אוסף שאלות שכבר הופיעו, למניעת כפילויות
+        self.failed_categories = set()      # אוסף קטגוריות שכשלנו להביא בהן שאלות
+        self.question_cache = {}            # מטמון שאלות לכל קטגוריה
+        self.current_question = None        # השאלה הנוכחית (tuple: (שאלה, אופציות, תשובה-נכונה))
+
+        # הגדרות משחק
+        self.questions_per_category = 5     # מספר שאלות לכל קטגוריה
+        self.total_categories_to_play = 6   # סך מספר הקטגוריות לשחק
+        self.total_questions = (self.questions_per_category *
+                                self.total_categories_to_play)  # 30 (ברירת מחדל)
+
+        # פידבק על תשובות נכונות/שגויות
+        self.feedback_message = None        # טקסט הפידבק (נכון/לא נכון)
+        self.feedback_timer = 0             # טיימר להצגת הפידבק
+
+        # צלילים (יטענו לאחר-מכן מבחוץ)
+        self.correct_sound = None
+        self.incorrect_sound = None
+
+        # אתחול וחיבור למסד הנתונים
+        self.initialize_database()
+
+    def initialize_database(self):
+        """
+        מוודא שהטבלה scores קיימת במסד הנתונים. אם לא, יוצרת אותה.
+        """
+        try:
+            conn = mysql.connector.connect(
+                host=self.db_host,
+                user=self.db_user,
+                password=self.db_password,
+                database=self.db_name
+            )
+            cursor = conn.cursor()
+
+            # יצירת הטבלה אם היא לא קיימת
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS scores (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                player_name VARCHAR(255) NOT NULL,
+                score INT NOT NULL,
+                category VARCHAR(255) NOT NULL,
+                date_played DATETIME NOT NULL
+            )
+            ''')
+            conn.commit()
+            conn.close()
+            print("✅ Database initialized successfully")
+
+        except mysql.connector.Error as e:
+            print(f"❌ Error initializing database: {e}")
+            sys.exit(1)  # אם לא מצליחים להתחבר/ליצור טבלה – סיים את התוכנית
+
+    def save_score(self, player_name, score, category):
+        """
+        שמירת ניקוד במסד הנתונים תחת השם והקטגוריה המבוקשת.
+        מחזיר את התאריך והשעה בה נשמר הניקוד.
+        """
+        date_played = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            conn = mysql.connector.connect(
+                host=self.db_host,
+                user=self.db_user,
+                password=self.db_password,
+                database=self.db_name
+            )
+            cursor = conn.cursor()
+
+            cursor.execute(
+                "INSERT INTO scores (player_name, score, category, date_played) VALUES (%s, %s, %s, %s)",
+                (player_name, score, category, date_played)
+            )
+            conn.commit()
+            conn.close()
+            print(f"✅ Score saved: {player_name}, {score}, {category}, {date_played}")
+        except mysql.connector.Error as e:
+            print(f"❌ Error saving score: {e}")
+
+        return date_played
+
+    def fetch_question_from_ai(self, category, difficulty):
+        """
+        שליפת שאלה מה־API (Groq) בהתאם לקטגוריה ורמת הקושי.
+        מחזיר tuple (question, options, answer) או (None, None, None) במקרה של כישלון.
+        """
+        url = "https://api.groq.com/openai/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {self.GROQ_API_KEY}",
+            "Content-Type": "application/json"
+        }
+
+        # ההנחיה למנוע הבינה המלאכותית
+        prompt = (
+            f"Generate a {difficulty} multiple-choice trivia question about {category}. "
+            "The question should be different from any you've generated before. "
+            "Strictly return only a JSON object like this: "
+            '{"question": "What is the capital of France?", "options": ["Berlin", "Madrid", "Paris", "Lisbon"], "answer": "Paris"}'
+        )
+
+        data = {
+            "model": "llama3-8b-8192",  # המודל ב־Groq API
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 300
+        }
+
+        try:
+            response = requests.post(url, headers=headers, json=data)
+            response_json = response.json()
+
+            # בודקים אם קיבלנו תשובה (choices)
+            if "choices" in response_json and len(response_json["choices"]) > 0:
+                ai_output = response_json["choices"][0]["message"]["content"]
+
+                # מוצאים גוש JSON מתוך הטקסט
+                json_match = re.search(r'\{.*\}', ai_output, re.DOTALL)
+                if json_match:
+                    json_str = json_match.group(0)
+                else:
+                    return None, None, None
+
+                try:
+                    data = json.loads(json_str)
+                    question_text = data["question"].strip()
+                    options = data["options"]
+                    answer = data["answer"]
+
+                    # וידוא שהתשובה קיימת באופציות
+                    if answer not in options:
+                        print(f"⚠️ Answer '{answer}' not in options. Fixing...")
+                        if len(options) > 0:
+                            options[-1] = answer
+                        else:
+                            options = [answer, "Option 2", "Option 3", "Option 4"]
+
+                    # בדיקה שלא שאלנו את השאלה הזו קודם
+                    if question_text.lower() in self.seen_questions:
+                        return None, None, None
+
+                    self.seen_questions.add(question_text.lower())
+                    return question_text, options, answer
+
+                except (json.JSONDecodeError, KeyError) as e:
+                    print(f"❌ Error parsing question JSON: {e}")
+                    return None, None, None
+        except Exception as e:
+            print(f"❌ Error fetching question from AI: {e}")
+
+        return None, None, None
+
+    def preload_questions_thread(self):
+        """
+        Thread לטעינה מוקדמת של שאלות לכל קטגוריה.
+        כך המשתמש לא יצטרך לחכות בזמן המשחק.
+        """
+        categories = ["History", "Computer Science", "Science", "Geography", "Movies", "Sports"]
+        print("🔄 Preloading questions in background...")
+
+        # עבור כל קטגוריה
+        for category in categories:
+            if category not in self.question_cache:
+                self.question_cache[category] = []
+
+            # נמשיך לטעון שאלות עד שנגיע למספר הרצוי
+            while len(self.question_cache[category]) < self.questions_per_category:
+                q, opts, ans = self.fetch_question_from_ai(category, "medium")
+                if q is not None:
+                    self.question_cache[category].append((q, opts, ans))
+                    print(f"✅ Preloaded question for {category} "
+                          f"({len(self.question_cache[category])}/{self.questions_per_category})")
+                else:
+                    # אם נכשלנו פעמיים באותה קטגוריה, נפסיק
+                    if category in self.failed_categories:
+                        print(f"❌ Failed to preload questions for {category}. Skipping.")
+                        break
+                    self.failed_categories.add(category)
+
+    def reset_game(self):
+        """
+        איפוס מוחלט של מצב המשחק לצורך משחק חדש.
+        """
+        self.selected_category = None
+        self.score = 0
+        self.current_question = None
+        self.questions_answered = 0
+        self.categories_completed = 0
+        self.game_over = False
+        self.date_played = None
+        self.feedback_message = None
+        self.feedback_timer = 0
+        self.used_categories = []
+        self.seen_questions.clear()
+        self.current_category_questions = 0
+        self.show_category_completed = False
+        self.category_completion_timer = 0
+        self.waiting_for_feedback = False
+        self.failed_categories = set()
+        self.question_cache = {}
+
+    def is_category_available(self, category):
+        """
+        בודק האם קטגוריה כבר שוחקה/נבחרה בעבר או לא.
+        אם כבר שוחקה, לא ניתן לבחור אותה שוב.
+        """
+        return category not in self.used_categories
+
+
+class TriviaView:
+    """
+    מחלקה זו (View) אחראית על כל מה שקשור להצגה וציור באמצעות Pygame:
+    - ציור רקעים, טקסט, כפתורים, תיבות שאלה ועוד.
+    - אין בה לוגיקת משחק או עסקית, רק קוד שמצייר מסכים בהתבסס על מצב נתון.
+    """
+
+    def __init__(self, width=1000, height=700):
+        # הגדרות חלון
+        self.WIDTH = width
+        self.HEIGHT = height
+        self.screen = pygame.display.set_mode((self.WIDTH, self.HEIGHT))
+        pygame.display.set_caption("Trivia Game - AI Generated Questions")
+
+        # צבעים לשימוש
+        self.WHITE = (255, 255, 255)
+        self.BLACK = (0, 0, 0)
+        self.BLUE = (70, 130, 180)
+        self.GREEN = (34, 139, 34)
+        self.RED = (220, 20, 60)
+        self.LIGHT_GRAY = (240, 240, 240)
+        self.YELLOW = (255, 215, 0)
+        self.PURPLE = (147, 112, 219)
+        self.HIGHLIGHT_COLOR = (200, 220, 255)
+        self.DISABLED_COLOR = (200, 200, 200)
+        self.DISABLED_TEXT = (150, 150, 150)
+
+        # פונטים
+        self.font = pygame.font.Font(None, 40)
+        self.large_font = pygame.font.Font(None, 60)
+        self.small_font = pygame.font.Font(None, 30)
+
+    def draw_gradient_background(self):
+        """
+        ציור רקע גראדיאנטי אנכי בין YELLOW ל־PURPLE.
+        """
+        for y in range(self.HEIGHT):
+            r = int(self.YELLOW[0] + (self.PURPLE[0] - self.YELLOW[0]) * y / self.HEIGHT)
+            g = int(self.YELLOW[1] + (self.PURPLE[1] - self.YELLOW[1]) * y / self.HEIGHT)
+            b = int(self.YELLOW[2] + (self.PURPLE[2] - self.YELLOW[2]) * y / self.HEIGHT)
+            pygame.draw.line(self.screen, (r, g, b), (0, y), (self.WIDTH, y))
+
+    def draw_text(self, text, x, y, font_obj, color=(0, 0, 0)):
+        """
+        ציור טקסט רגיל על המסך בנקודה (x,y).
+        """
+        text_surface = font_obj.render(text, True, color)
+        self.screen.blit(text_surface, (x, y))
+
+    def draw_text_centered(self, text, x, y, font_obj, color=(0, 0, 0)):
+        """
+        ציור טקסט ממורכז על המסך, כאשר (x,y) הוא מרכז הטקסט.
+        """
+        text_surface = font_obj.render(text, True, color)
+        text_rect = text_surface.get_rect(center=(x, y))
+        self.screen.blit(text_surface, text_rect)
+
+    def wrap_text(self, text, font_obj, max_width):
+        """
+        עוטף טקסט כך שלא יעבור רוחב מקסימלי מסוים (max_width).
+        מחזיר רשימת שורות.
+        """
+        words = text.split(" ")
+        lines = []
+        current_line = ""
+        for word in words:
+            test_line = current_line + word + " "
+            if font_obj.size(test_line)[0] < max_width:
+                current_line = test_line
+            else:
+                lines.append(current_line)
+                current_line = word + " "
+        if current_line:
+            lines.append(current_line)
+        return lines
+
+    def draw_question(self, question_data, mouse_pos):
+        """
+        מציג את השאלה והאפשרויות. מוסיף אפקט ריחוף על האופציות לפי מיקום העכבר.
+        """
+        if question_data is None or question_data[0] is None:
+            self.draw_text_centered(
+                "❌ Error: No question available",
+                self.WIDTH // 2, self.HEIGHT // 2,
+                self.large_font, self.RED
+            )
+            return
+
+        question_text, options, _ = question_data
+        wrapped_text = self.wrap_text(question_text, self.font, self.WIDTH - 100)
+
+        # ציור תיבת השאלה + צל (shadow)
+        question_box_height = len(wrapped_text) * 45 + 20
+        pygame.draw.rect(self.screen, (0, 0, 0, 50),
+                         (48, 98, self.WIDTH - 96, question_box_height),
+                         border_radius=10)
+        pygame.draw.rect(self.screen, self.WHITE,
+                         (45, 95, self.WIDTH - 90, question_box_height),
+                         border_radius=10)
+
+        # ציור הטקסט של השאלה
+        y_offset = 105
+        for line in wrapped_text:
+            self.draw_text(line, 60, y_offset, self.font, self.BLUE)
+            y_offset += 45
+
+        # ציור התשובות (אופציות)
+        answer_y = y_offset + 30
+        for i, option in enumerate(options):
+            option_rect = pygame.Rect(40, answer_y - 10, self.WIDTH - 80, 50)
+            # בדיקה אם העכבר מרחף מעל
+            if option_rect.collidepoint(mouse_pos):
+                pygame.draw.rect(self.screen, self.HIGHLIGHT_COLOR, option_rect, border_radius=5)
+            else:
+                pygame.draw.rect(self.screen, self.LIGHT_GRAY, option_rect, border_radius=5)
+
+            self.draw_text(f"{chr(65 + i)}. {option}", 60, answer_y, self.font)
+            answer_y += 70
+
+    def draw_feedback(self, feedback_message, feedback_timer):
+        """
+        מציג פידבק (Correct / Incorrect) לזמן קצר על המסך.
+        """
+        if feedback_message:
+            color = self.GREEN if "Correct" in feedback_message else self.RED
+            # רקע חצי-שקוף להצגת הפידבק
+            s = pygame.Surface((self.WIDTH - 100, 130), pygame.SRCALPHA)
+            s.fill((255, 255, 255, 220))
+            self.screen.blit(s, (50, self.HEIGHT // 2 - 65))
+
+            # אם ההודעה ארוכה, נשתמש בפונטים קטנים יותר
+            if len(feedback_message) > 40:
+                lines = self.wrap_text(feedback_message, self.small_font, self.WIDTH - 150)
+                y_offset = self.HEIGHT // 2 - 40
+                for line in lines:
+                    self.draw_text_centered(line, self.WIDTH // 2, y_offset, self.small_font, color)
+                    y_offset += 30
+            else:
+                self.draw_text_centered(feedback_message, self.WIDTH // 2, self.HEIGHT // 2,
+                                        self.font, color)
+
+    def draw_category_completed(self, model):
+        """
+        מסך ביניים כאשר השחקן סיים את כל השאלות בקטגוריה מסוימת.
+        מציג סיכום ביניים ונותן כפתור לבחור קטגוריה חדשה.
+        """
+        self.draw_gradient_background()
+
+        # כותרת עם צל
+        pygame.draw.rect(self.screen, (0, 0, 0, 50),
+                         (self.WIDTH // 2 - 230, 98, 460, 60),
+                         border_radius=10)
+        pygame.draw.rect(self.screen, self.WHITE,
+                         (self.WIDTH // 2 - 225, 95, 450, 60),
+                         border_radius=10)
+        self.draw_text_centered("Category Completed!",
+                                self.WIDTH // 2, 125,
+                                self.large_font, self.BLUE)
+
+        # תיבת סטטיסטיקה
+        stats_box = pygame.Rect(self.WIDTH // 2 - 250, 180, 500, 220)
+        pygame.draw.rect(self.screen, (0, 0, 0, 50), stats_box.inflate(6, 6), border_radius=15)
+        pygame.draw.rect(self.screen, self.WHITE, stats_box, border_radius=15)
+
+        # הצגת פרטי ביניים
+        self.draw_text_centered(f"Player: {model.player_name}", self.WIDTH // 2, 220, self.font, self.BLACK)
+        self.draw_text_centered(f"Current Score: {model.score}/{model.total_questions}",
+                                self.WIDTH // 2, 270, self.font, self.GREEN)
+        self.draw_text_centered(f"Categories Completed: {model.categories_completed}/{model.total_categories_to_play}",
+                                self.WIDTH // 2, 320, self.font, self.BLUE)
+        questions_left = model.total_questions - model.questions_answered
+        self.draw_text_centered(f"Questions Left: {questions_left}",
+                                self.WIDTH // 2, 370, self.font, self.BLACK)
+
+        # כפתור המשך לקטגוריה הבאה
+        button_rect = pygame.Rect(self.WIDTH // 2 - 180, 450, 360, 70)
+
+        # רק אחרי שהטיימר מסתיים, נציג את הכפתור לפעולה
+        if model.category_completion_timer <= 0:
+            pygame.draw.rect(self.screen, (0, 0, 0, 50), button_rect.inflate(6, 6), border_radius=10)
+            pygame.draw.rect(self.screen, self.LIGHT_GRAY, button_rect, border_radius=10)
+
+            mouse_pos = pygame.mouse.get_pos()
+            if button_rect.collidepoint(mouse_pos):
+                pygame.draw.rect(self.screen, self.HIGHLIGHT_COLOR, button_rect, border_radius=10)
+
+            self.draw_text_centered("Choose Next Category", self.WIDTH // 2, 485, self.font, self.BLUE)
+        else:
+            # מציגים טיימר שעליו צריך לחכות
+            model.category_completion_timer -= 1
+            self.draw_text_centered(f"Next in {model.category_completion_timer // 30 + 1}...",
+                                    self.WIDTH // 2, 485, self.font, self.BLUE)
+
+    def draw_game_over(self, model):
+        """
+        מסך סיום המשחק. מציג ניקוד סופי, אחוזי הצלחה, תאריך ועוד.
+        כולל כפתורים: שחק שוב (Play Again) או צא (Quit).
+        """
+        self.draw_gradient_background()
+
+        # ציור גביע (רק לצורך קישוט)
+        pygame.draw.polygon(self.screen, self.YELLOW, [
+            (self.WIDTH // 2, 50),
+            (self.WIDTH // 2 - 60, 70),
+            (self.WIDTH // 2 - 30, 120),
+            (self.WIDTH // 2 + 30, 120),
+            (self.WIDTH // 2 + 60, 70)
+        ])
+        pygame.draw.rect(self.screen, self.YELLOW, (self.WIDTH // 2 - 20, 120, 40, 30))
+        pygame.draw.rect(self.screen, self.YELLOW, (self.WIDTH // 2 - 40, 150, 80, 10))
+
+        # כותרת
+        self.draw_text_centered("Game Completed!", self.WIDTH // 2, 200, self.large_font, self.BLUE)
+
+        # תיבת סטטיסטיקה
+        stats_box = pygame.Rect(self.WIDTH // 2 - 200, 250, 400, 180)
+        pygame.draw.rect(self.screen, (0, 0, 0, 50), stats_box.inflate(6, 6), border_radius=15)
+        pygame.draw.rect(self.screen, self.WHITE, stats_box, border_radius=15)
+
+        # הצגת פרטים
+        self.draw_text_centered(f"Player: {model.player_name}", self.WIDTH // 2, 280, self.font, self.BLACK)
+        self.draw_text_centered(f"Final Score: {model.score}/{model.total_questions}",
+                                self.WIDTH // 2, 320, self.font, self.BLACK)
+        percentage = (model.score / model.total_questions) * 100
+
+        # צביעת האחוז בהתאם לרמת הביצוע
+        percentage_color = self.RED
+        if percentage >= 80:
+            percentage_color = self.GREEN
+        elif percentage >= 60:
+            percentage_color = self.BLUE
+
+        self.draw_text_centered(f"Percentage: {percentage:.1f}%", self.WIDTH // 2, 360, self.font, percentage_color)
+
+        # תאריך
+        if not model.date_played:
+            model.date_played = datetime.now().strftime("%d/%m/%Y %H:%M")
+        self.draw_text_centered(f"Date: {model.date_played}", self.WIDTH // 2, 400, self.font, self.BLACK)
+
+        # כפתור "Play Again"
+        play_again_rect = pygame.Rect(self.WIDTH // 2 - 150, 450, 300, 60)
+        mouse_pos = pygame.mouse.get_pos()
+
+        # צל + כפתור
+        pygame.draw.rect(self.screen, (0, 0, 0, 50), play_again_rect.inflate(6, 6), border_radius=10)
+        if play_again_rect.collidepoint(mouse_pos):
+            pygame.draw.rect(self.screen, self.HIGHLIGHT_COLOR, play_again_rect, border_radius=10)
+        else:
+            pygame.draw.rect(self.screen, self.LIGHT_GRAY, play_again_rect, border_radius=10)
+        self.draw_text_centered("Play Again", self.WIDTH // 2, 480, self.font, self.BLUE)
+
+        # כפתור "Quit"
+        quit_rect = pygame.Rect(self.WIDTH // 2 - 150, 530, 300, 60)
+        pygame.draw.rect(self.screen, (0, 0, 0, 50), quit_rect.inflate(6, 6), border_radius=10)
+        if quit_rect.collidepoint(mouse_pos):
+            pygame.draw.rect(self.screen, self.HIGHLIGHT_COLOR, quit_rect, border_radius=10)
+        else:
+            pygame.draw.rect(self.screen, self.LIGHT_GRAY, quit_rect, border_radius=10)
+        self.draw_text_centered("Quit Game", self.WIDTH // 2, 560, self.font, self.RED)
+
+    def draw_loading(self, model):
+        """
+        מסך טעינה. מציג אנימציית "דופק" (pulse) וסטטוס טעינת השאלות.
+        """
+        # ערך בין 0 ל-1 (מוד 1000 מילישניות)
+        pulse = (pygame.time.get_ticks() % 1000) / 1000
+        radius = 30 + int(10 * pulse)  # רדיוס משנה גודל בין 30 ל-40
+
+        pygame.draw.circle(self.screen, self.BLUE, (self.WIDTH // 2, self.HEIGHT // 2 - 50), radius)
+        pygame.draw.circle(self.screen, self.WHITE, (self.WIDTH // 2, self.HEIGHT // 2 - 50), radius - 5)
+
+        self.draw_text_centered("Loading question...", self.WIDTH // 2, self.HEIGHT // 2 + 20,
+                                self.large_font, self.BLUE)
+        self.draw_text_centered(f"Category: {model.selected_category}",
+                                self.WIDTH // 2, self.HEIGHT // 2 + 80,
+                                self.font)
+
+        # מציגים גם התקדמות
+        display_question_num = model.current_category_questions if model.current_category_questions > 0 else 1
+        self.draw_text_centered(f"Question {display_question_num}/{model.questions_per_category}",
+                                self.WIDTH // 2, self.HEIGHT // 2 + 120,
+                                self.font)
+        self.draw_text_centered(f"Total Progress: {model.questions_answered}/{model.total_questions}",
+                                self.WIDTH // 2, self.HEIGHT // 2 + 160,
+                                self.font)
+
+
+class TriviaController:
+    """
+    מחלקה זו (Controller) מנהלת את הזרימה של המשחק:
+    - קליטת אירועים (עכבר, מקלדת).
+    - עדכון ה־Model (מצב המשחק) בהתאם לאירועים.
+    - קריאה ל־View לציור התצוגה המתאימה.
+    - ניהול הלולאה הראשית של המשחק.
+    """
+
+    def __init__(self, model, view):
+        self.model = model
+        self.view = view
+        self.running = True
+        self.clock = pygame.time.Clock()
+        self.loading = False  # האם אנחנו במצב "טוענים שאלה" כעת
+
+        # טוענים צלילים ומוזיקת רקע (לא חלק מה־Model, כדי שהקצבים יחיו ב־Controller / ה־View)
+        self.load_audio()
+
+        # פתיחת Thread לטעינה מוקדמת של שאלות
+        preload_thread = threading.Thread(target=self.model.preload_questions_thread)
+        preload_thread.daemon = True
+        preload_thread.start()
+
+    def load_audio(self):
+        """
+        טוען קבצי אודיו ומוזיקת רקע, ושומר אותם ב־Model (correct_sound, incorrect_sound).
+        """
+        try:
+            # מוזיקת רקע
+            pygame.mixer.music.load("chill-drum-loop-6887.mp3")
+
+            # צלילים של נכון/לא נכון
+            self.model.correct_sound = pygame.mixer.Sound("ding-small-bell-sfx-233008.mp3")
+            self.model.incorrect_sound = pygame.mixer.Sound("incorrect-293358.mp3")
+
+        except pygame.error as e:
+            print(f"Error loading audio files: {e}. Please ensure the files are in the working directory: {os.getcwd()}")
+            sys.exit(1)
+
+        # הפעלת המוזיקה
+        pygame.mixer.music.play(-1)
+        pygame.mixer.music.set_volume(0.3)
+
+    def get_player_name(self):
+        """
+        מסך תחילי שבו מבקשים מהמשתמש להזין את שמו לפני התחלת המשחק.
+        מחזיר את השם שהוזן.
+        """
+        input_box_rect = pygame.Rect(self.view.WIDTH // 2 - 200, self.view.HEIGHT // 2, 400, 60)
+        player_name = ""
+        active = True
+        font = pygame.font.Font(None, 40)
+
+        while active:
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    pygame.quit()
+                    sys.exit()
+                elif event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_RETURN and player_name.strip():
+                        print(f"✅ Player entered name: {player_name}")
+                        return player_name.strip()
+                    elif event.key == pygame.K_BACKSPACE:
+                        player_name = player_name[:-1]
+                    else:
+                        player_name += event.unicode
+
+            self.view.draw_gradient_background()
+            self.view.draw_text_centered("Enter your name:",
+                                         self.view.WIDTH // 2,
+                                         self.view.HEIGHT // 2 - 50,
+                                         self.view.large_font,
+                                         self.view.BLUE)
+
+            # תיבת טקסט בה השחקן מקליד את שמו
+            pygame.draw.rect(self.view.screen, self.view.LIGHT_GRAY, input_box_rect, border_radius=5)
+            text_surface = font.render(player_name, True, self.view.BLACK)
+            self.view.screen.blit(text_surface, (input_box_rect.x + 10, input_box_rect.y + 10))
+
+            pygame.display.flip()
+            pygame.time.Clock().tick(30)
+
+    def generate_next_question(self):
+        """
+        מייצר שאלה חדשה ב-Thread רקע כדי לא לחסום את הלולאה הראשית.
+        מעדכן את ה־Model בשאלה החדשה (או במצב "סיימנו קטגוריה" / "סיימנו משחק").
+        """
+        def target():
+            # אם זו השאלה הראשונה בקטגוריה הנוכחית
+            if self.model.current_category_questions == 0:
+                self.model.current_category_questions = 1
+            elif self.model.current_category_questions < self.model.questions_per_category:
+                self.model.current_category_questions += 1
+
+            # מגדילים מונה כללי של שאלות שנענו
+            self.model.questions_answered += 1
+
+            # בדיקה אם סיימנו את הקטגוריה (הגענו למספר שאלות הדרוש בקטגוריה)
+            if self.model.current_category_questions >= self.model.questions_per_category:
+                self.model.categories_completed += 1
+                self.model.used_categories.append(self.model.selected_category)
+                self.model.current_category_questions = 0
+
+                # בדיקה אם סיימנו את כל הקטגוריות
+                if self.model.categories_completed >= self.model.total_categories_to_play:
+                    self.loading = False
+                    self.model.game_over = True
+                    # שמירת ציון "כללי" – כי שיחקנו במספר קטגוריות
+                    self.model.date_played = self.model.save_score(
+                        self.model.player_name,
+                        self.model.score,
+                        "Multiple Categories"
+                    )
+                    return
+                else:
+                    # אם עוד לא סיימנו את המשחק, מציגים "קטגוריה הושלמה" אלא אם מחכים לפידבק
+                    if not self.model.waiting_for_feedback:
+                        self.loading = False
+                        self.model.show_category_completed = True
+                        self.model.category_completion_timer = 90  # למשל, 3 שניות (30 FPS)
+                        return
+
+            # ניסיון להשתמש בשאלות שהגיעו בטעינה המוקדמת (cache)
+            if (self.model.selected_category in self.model.question_cache and
+                    self.model.question_cache[self.model.selected_category]):
+                self.model.current_question = self.model.question_cache[self.model.selected_category].pop(0)
+                self.loading = False
+                return
+
+            # אם אין במטמון, ננסה ליצור שאלה מה־API
+            max_attempts = 10
+            attempts = 0
+            result = (None, None, None)
+            print(f"🔄 Generating question {self.model.questions_answered} "
+                  f"(Category: {self.model.selected_category})...")
+
+            while attempts < max_attempts:
+                result = self.model.fetch_question_from_ai(self.model.selected_category, "medium")
+                if result[0] is not None:
+                    break
+                attempts += 1
+                print(f"⚠️ Attempt {attempts}/{max_attempts} failed for {self.model.selected_category}")
+
+            # אם נכשלנו לגמרי – ניצור שאלה בסיסית fallback
+            if result[0] is None:
+                print(f"❌ Failed to generate question for {self.model.selected_category} after {max_attempts} attempts")
+                question = f"What category is this question from?"
+                options = ["History", "Science", "Geography", self.model.selected_category]
+                answer = self.model.selected_category
+                result = (question, options, answer)
+
+            # שמירת השאלה
+            self.model.current_question = result
+            self.loading = False
+
+        self.loading = True
+        thread = threading.Thread(target=target)
+        thread.daemon = True
+        thread.start()
+
+    def run(self):
+        """
+        לולאת המשחק הראשית – מנהלת את הזרימה של המשחק (events, updates, drawing).
+        """
+        # בתחילת המשחק, מבקשים שם שחקן
+        self.model.player_name = self.get_player_name()
+
+        while self.running:
+            mouse_pos = pygame.mouse.get_pos()
+
+            # עיבוד אירועי משתמש
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    self.running = False
+
+                elif event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_ESCAPE:
+                        self.running = False
+
+                    # בחירת קטגוריה במקשי 1-6 (במידה ואפשר)
+                    elif (self.model.selected_category is None and
+                          not self.model.show_category_completed and
+                          event.key in [pygame.K_1, pygame.K_2, pygame.K_3,
+                                        pygame.K_4, pygame.K_5, pygame.K_6]):
+                        categories = ["History", "Computer Science", "Science",
+                                      "Geography", "Movies", "Sports"]
+                        selected_index = event.key - pygame.K_1
+                        if 0 <= selected_index < len(categories):
+                            cat = categories[selected_index]
+                            if self.model.is_category_available(cat):
+                                self.model.selected_category = cat
+                                print(f"✅ Selected category: {cat}")
+                                self.generate_next_question()
+
+                elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                    # אם המשחק הסתיים - בודקים אם לחצו על Play Again או Quit
+                    if self.model.game_over:
+                        play_again_rect = pygame.Rect(self.view.WIDTH // 2 - 150, 450, 300, 60)
+                        quit_rect = pygame.Rect(self.view.WIDTH // 2 - 150, 530, 300, 60)
+
+                        if play_again_rect.collidepoint(mouse_pos):
+                            # איפוס וניסיון מחדש
+                            self.model.reset_game()
+                            # נתחיל לטעון שאלות מחדש
+                            threading.Thread(target=self.model.preload_questions_thread).start()
+                            # שוב מבקשים שם
+                            self.model.player_name = self.get_player_name()
+                        elif quit_rect.collidepoint(mouse_pos):
+                            self.running = False
+
+                    # אם סיימנו קטגוריה – מסך קטגוריה הושלמה
+                    elif self.model.show_category_completed:
+                        button_rect = pygame.Rect(self.view.WIDTH // 2 - 180, 450, 360, 70)
+                        if (button_rect.collidepoint(mouse_pos) and
+                                self.model.category_completion_timer <= 0):
+                            self.model.show_category_completed = False
+                            self.model.selected_category = None
+
+                    # אם אנחנו במסך בחירת קטגוריה
+                    elif self.model.selected_category is None:
+                        categories = ["History", "Computer Science", "Science",
+                                      "Geography", "Movies", "Sports"]
+                        for i, cat in enumerate(categories):
+                            y_pos = 245 + i * 60
+                            rect = pygame.Rect(290, y_pos, 350, 50)
+
+                            if rect.collidepoint(mouse_pos) and cat not in self.model.used_categories:
+                                self.model.selected_category = cat
+                                print(f"✅ Selected category: {cat}")
+                                self.generate_next_question()
+                                break
+
+                    # אחרת, אנחנו במסך שאלה (במשחק)
+                    elif (self.model.current_question is not None and
+                          not self.loading and
+                          self.model.feedback_message is None):
+                        # בדיקת לחיצה על אחת התשובות
+                        options = self.model.current_question[1]
+                        correct_answer = self.model.current_question[2]
+                        wrapped_text = self.view.wrap_text(self.model.current_question[0],
+                                                           self.view.font,
+                                                           self.view.WIDTH - 100)
+                        # מחשבים היכן מתחילות האפשרויות
+                        answer_y_start = 105 + len(wrapped_text) * 45 + 30
+
+                        # עבור כל אופציה בודקים אם נלחץ
+                        for i, option in enumerate(options):
+                            option_rect = pygame.Rect(40, answer_y_start - 10,
+                                                      self.view.WIDTH - 80, 50)
+                            if option_rect.collidepoint(mouse_pos):
+                                # בדיקה אם זה תשובה נכונה או לא
+                                if option == correct_answer:
+                                    self.model.score += 1
+                                    self.model.feedback_message = "Correct!"
+                                    self.model.correct_sound.play()
+                                    print(f"✅ Correct! New score: {self.model.score}")
+                                else:
+                                    self.model.feedback_message = f"Incorrect! The answer is: {correct_answer}"
+                                    self.model.incorrect_sound.play()
+                                    print(f"❌ Wrong! Correct answer was: {correct_answer}")
+
+                                self.model.feedback_timer = 30  # מציגים פידבק למשך ~1 שנייה
+                                self.model.waiting_for_feedback = True
+
+                                # הפונקציה הזו (delayed_next_question) תמתין ואז תפיק שאלה חדשה
+                                def delayed_next_question():
+                                    pygame.time.wait(1000)
+                                    self.model.waiting_for_feedback = False
+                                    self.generate_next_question()
+
+                                threading.Thread(target=delayed_next_question, daemon=True).start()
+
+                                break
+                            answer_y_start += 70
+
+            # --- ציור מסך ---
+
+            # רקע
+            self.view.draw_gradient_background()
+
+            # אם המשחק נגמר – מסך סיום
+            if self.model.game_over:
+                self.view.draw_game_over(self.model)
+
+            # אם סיימנו קטגוריה – מסך ביניים
+            elif self.model.show_category_completed:
+                self.view.draw_category_completed(self.model)
+
+            # אם עוד לא נבחרה קטגוריה (מסך בחירת קטגוריה)
+            elif self.model.selected_category is None:
+                # כותרת עם שם השחקן
+                self.view.draw_text_centered(f"Welcome, {self.model.player_name}!",
+                                             self.view.WIDTH // 2, 50,
+                                             self.view.large_font, self.view.BLUE)
+
+                # מציגים סטטוס אם כבר התחלנו לשחק
+                if self.model.categories_completed > 0:
+                    stats_box = pygame.Rect(self.view.WIDTH - 320, 20, 300, 90)
+                    pygame.draw.rect(self.view.screen, (255, 255, 255, 180), stats_box, border_radius=10)
+                    self.view.draw_text(f"Score: {self.model.score}/{self.model.total_questions}",
+                                        self.view.WIDTH - 310, 30, self.view.font, self.view.GREEN)
+                    self.view.draw_text(
+                        f"Categories: {self.model.categories_completed}/{self.model.total_categories_to_play}",
+                        self.view.WIDTH - 310, 70, self.view.font, self.view.BLUE
+                    )
+
+                # כותרת "בחר קטגוריה"
+                pygame.draw.rect(self.view.screen, self.view.WHITE, (190, 140, 620, 60), border_radius=10)
+                self.view.draw_text_centered("Select a Category:",
+                                             self.view.WIDTH // 2, 170,
+                                             self.view.large_font, self.view.BLUE)
+
+                # מציגים את הקטגוריות כלחיצות
+                categories = ["History", "Computer Science", "Science", "Geography", "Movies", "Sports"]
+                for i, cat in enumerate(categories):
+                    y_pos = 245 + i * 60
+                    rect = pygame.Rect(290, y_pos, 350, 50)
+
+                    if cat in self.model.used_categories:
+                        # קטגוריה שכבר שוחקה
+                        pygame.draw.rect(self.view.screen, (0, 0, 0, 30), rect.inflate(4, 4), border_radius=5)
+                        pygame.draw.rect(self.view.screen, self.view.DISABLED_COLOR, rect, border_radius=5)
+                        self.view.draw_text(f"{i + 1}. {cat} (Completed)",
+                                            rect.x + 10, rect.y + 5,
+                                            self.view.font, self.view.DISABLED_TEXT)
+                    else:
+                        # קטגוריה זמינה
+                        pygame.draw.rect(self.view.screen, (0, 0, 0, 50),
+                                         rect.inflate(4, 4), border_radius=5)
+
+                        if rect.collidepoint(mouse_pos):
+                            pygame.draw.rect(self.view.screen, self.view.HIGHLIGHT_COLOR, rect, border_radius=5)
+                        else:
+                            pygame.draw.rect(self.view.screen, self.view.LIGHT_GRAY, rect, border_radius=5)
+
+                        self.view.draw_text(f"{i + 1}. {cat}",
+                                            rect.x + 10, rect.y + 5,
+                                            self.view.font, self.view.BLACK)
+
+            # אם אנחנו בטעינת שאלה (לוקח כמה שניות/שגיאה אפשרית)
+            elif self.loading:
+                self.view.draw_loading(self.model)
+
+            else:
+                # מסך שאלה
+                # bar עליון עם מידע על ההתקדמות
+                pygame.draw.rect(self.view.screen, (255, 255, 255, 180), (0, 0, self.view.WIDTH, 80))
+                display_question_num = (self.model.current_category_questions
+                                        if self.model.current_category_questions > 0 else 1)
+                self.view.draw_text(f"Question {display_question_num}/{self.model.questions_per_category}",
+                                    self.view.WIDTH - 250, 20, self.view.font)
+                self.view.draw_text(f"Score: {self.model.score}",
+                                    self.view.WIDTH - 150, 50,
+                                    self.view.font, self.view.GREEN)
+                self.view.draw_text(f"Category: {self.model.selected_category}",
+                                    50, 20, self.view.font, self.view.BLUE)
+                self.view.draw_text(f"Total Progress: {self.model.questions_answered}/{self.model.total_questions}",
+                                    50, 50, self.view.font)
+
+                # ציור השאלה עצמה
+                self.view.draw_question(self.model.current_question, mouse_pos)
+
+                # ציור פידבק אם יש
+                if self.model.feedback_message:
+                    self.view.draw_feedback(self.model.feedback_message, self.model.feedback_timer)
+                    self.model.feedback_timer -= 1
+                    if self.model.feedback_timer <= 0:
+                        self.model.feedback_message = None
+
+            pygame.display.flip()
+            self.clock.tick(30)
+
+
+def main():
+    """
+    הפונקציה הראשית, שיוצרת את ה־Model, View, Controller ומפעילה את המשחק.
+    """
+    model = TriviaModel()
+    view = TriviaView()
+    controller = TriviaController(model, view)
+    controller.run()
+    pygame.quit()
+    sys.exit()
+
+
+if __name__ == "__main__":
+    main()
